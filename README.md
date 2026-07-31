@@ -9,6 +9,19 @@ This tree is [`local-inference-lab/vllm`](https://github.com/local-inference-lab
 at branch `lucifer` (commit `7c6bbf4`), plus a `deploy/` directory with the
 build/run scripts used on this machine. Upstream vLLM README: [README.vllm.md](README.vllm.md).
 
+**Two model variants are supported** (each needs its own conda env and stack —
+build both, run one at a time since each fills both GPUs):
+
+| Variant | Env | Build script | vLLM pin |
+|---|---|---|---|
+| DeepSeek-V4-Flash (original) | `deepseekv4` | `deploy/build-sm120.sh` | `lucifer` @ 7c6bbf4 |
+| DeepSeek-V4-Flash-0731 (DSpark refresh) | `deepseekv40731` | `deploy/build-sm120-0731.sh` | `codex/ds4dspark-v7-pr60` @ ea45be31 |
+
+`deploy/start-deepseek.sh` offers both at launch (menu). The 0731 checkpoint
+adds DSpark block compression (config `dspark_*`, layers 40–42) and DSpark
+block speculative decoding, which needed a newer stack and three non-obvious
+launch changes vs the original — see "0731 differences" below.
+
 ## Why stock vLLM doesn't work
 
 vLLM's CUDA implementation of DeepSeek-V4 hard-requires **DeepGEMM** in three
@@ -68,12 +81,40 @@ extra minutes JIT-compiling kernels; later launches reuse the cache.
 Sampling per the model card: `temperature=1.0, top_p=1.0`. Thinking mode is
 selected per request via `chat_template_kwargs: {"thinking": true}`.
 
-## Measured results (2026-07-17, 2× RTX PRO 6000, TP=2, MTP 2 tokens, 256K ctx)
+## Measured results (2× RTX PRO 6000, TP=2, 256K ctx, single-stream)
 
-- **202 tok/s** single-stream decode at short context (thinking mode)
-- **161 tok/s** single-stream decode at 4.5K-token context, **TTFT 0.58s**
-- Needle-in-haystack retrieval correct at 4–5K context (sparse indexer verified)
-- Matches the ~210 tok/s reference from the same stack in Docker.
+| Metric | V4-Flash (original, MTP-2) | V4-Flash-0731 (DSpark-5) |
+|---|---|---|
+| Decode, short ctx (thinking) | 202 tok/s | 204 tok/s |
+| Decode, 4.5K ctx | 161 tok/s | 131–136 tok/s |
+| TTFT, 4.5K ctx (cold) | 0.58s | ~1.0s |
+| Needle retrieval @4–5K | ✓ | ✓ |
+
+Both correct; the original is faster in these **single-stream** tests. DSpark's
+5-token block drafting is tuned for batched throughput rather than single-stream
+latency, and 0731 carries extra per-layer compression compute — so single-stream
+decode being a bit lower is expected and not a regression in the build. (The
+original's numbers match the ~210 tok/s Docker reference.)
+
+## 0731 differences (what changed vs the original build)
+
+Three non-obvious launch changes, all handled by `deploy/start-deepseek.sh`
+when you pick model 2:
+
+1. **No `--attention-backend`.** The DSpark branch dropped the lucifer
+   `SPARSE_MLA_SM120` alias; on SM120 the V4 layer auto-selects its FlashInfer
+   sparse-MLA path when no backend is forced. (Forcing the old alias errors.)
+2. **`--speculative-config '{"method":"dspark","num_speculative_tokens":5}'`**,
+   not `mtp`. The draft module ships inside the target checkpoint under `mtp.*`;
+   plain `mtp` looks for `model.layers.43.mtp_block.*` and fails.
+3. **`VLLM_USE_V2_MODEL_RUNNER=1`.** The DSparkSpeculator only exists in the V2
+   model runner (`vllm/v1/worker/gpu/`), and `DeepseekV4ForCausalLM` is not a
+   default-V2 arch, so it must be forced or spec-decode init raises a missing
+   `pard_token`/`ptd_token_id` error.
+
+Also note the newer stack raises torch to 2.12.0+cu130 and needs cuDNN dev
+headers present at build time (`conda install -c nvidia cudnn`); FlashInfer's
+sparse-MLA modules moved under `flashinfer/mla/` at this pin.
 
 ## Operational notes (learned the hard way)
 
@@ -88,3 +129,13 @@ selected per request via `chat_template_kwargs: {"thinking": true}`.
 - If you ever re-checkout DeepGEMM to a different commit, `rm -rf build`
   before reinstalling — setuptools silently reuses stale compiled objects
   and you get baffling template-arity mismatches at JIT time.
+- **conda activation exports sabotage out-of-env AOT builds.** After
+  `conda install cuda-toolkit`, activation sets `CMAKE_PREFIX_PATH`,
+  `CMAKE_ARGS`, `LDFLAGS`, `CFLAGS` that steer cmake's `find_package(CUDA)`
+  and compiler/linker into the conda prefix — producing "Could NOT find CUDA"
+  even with a valid system toolkit. Unset all of them and shim system binutils
+  (`ld`/`ar`/`ranlib`) ahead of conda's in `PATH`. `deploy/build-sm120-0731.sh`
+  does this via an `env -u ...` wrapper around the vLLM build.
+- Pin **exact commits, never PR heads.** The FlashInfer/DeepGEMM PRs moved
+  after the reference image pinned them; a later revision even renamed the
+  module vLLM imports. Both build scripts use the frozen commits.

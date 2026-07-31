@@ -16,7 +16,49 @@
 # sourced below). First launch takes ~5-6 min extra for JIT + CUDA graphs.
 
 LOG_DIR=~/deepseek-service
-MODEL_PATH=~/models/deepseek
+
+# ─────────────────────────────────────────────
+# Model selection (one at a time - both need TP=2 across both GPUs)
+# Both serve under the API name "DeepSeek-V4-Flash" so claude-deepseek
+# works unchanged regardless of which variant is running.
+# ─────────────────────────────────────────────
+echo "========================================="
+echo "  DeepSeek-V4 Server"
+echo "========================================="
+echo ""
+echo "Choose model:"
+echo ""
+echo "1) DeepSeek-V4-Flash        (original, conda env: deepseekv4)"
+echo "2) DeepSeek-V4-Flash-0731   (dspark refresh, conda env: deepseekv40731)"
+echo ""
+read -p "Enter choice [1-2]: " model_choice
+
+case $model_choice in
+    1)
+        MODEL_PATH=~/models/deepseek/deepseekv4flash
+        CONDA_ENV=deepseekv4
+        MODEL_LABEL="DeepSeek-V4-Flash (lucifer build)"
+        # lucifer fork exposes the SPARSE_MLA_SM120 alias explicitly
+        ATTN_ARGS=(--attention-backend SPARSE_MLA_SM120)
+        MODEL_ENV=""
+        ;;
+    2)
+        MODEL_PATH=~/models/deepseek/deepseekv4flash0731
+        CONDA_ENV=deepseekv40731
+        MODEL_LABEL="DeepSeek-V4-Flash-0731 (ds4dspark build)"
+        # dspark branch dropped that alias; V4 auto-selects the SM120 DSv4
+        # FlashInfer sparse-MLA path when no --attention-backend is given
+        ATTN_ARGS=()
+        # DSpark speculative decoding lives only in the V2 model runner
+        # (vllm/v1/worker/gpu/). DeepseekV4 is not a default-V2 arch, so force it.
+        MODEL_ENV="VLLM_USE_V2_MODEL_RUNNER=1"
+        ;;
+    *)
+        echo "Invalid choice. Exiting."
+        exit 1
+        ;;
+esac
+
 LOG_FILE=$LOG_DIR/deepseek-v4-flash-vllm.log
 PID_FILE=$LOG_DIR/deepseek-v4-server.pid
 PORT_FILE=$LOG_DIR/deepseek-v4-server.port
@@ -148,8 +190,20 @@ esac
 echo ""
 echo "Choose mode:"
 echo ""
+# Speculative decoding differs by checkpoint:
+#  - lucifer V4-Flash: serial MTP (1 nextn layer), method "mtp"
+#  - 0731 dspark: parallel block draft (dspark_block_size=5, layers 40-42),
+#    method "dspark", draft module ships inside the target checkpoint (mtp.*)
+if [ "$CONDA_ENV" = "deepseekv40731" ]; then
+    SPEC_CONFIG='{"method":"dspark","num_speculative_tokens":5}'
+    SPEC_MENU_LABEL="Tools + DSpark (block draft, 5 tokens)"
+else
+    SPEC_CONFIG='{"method":"mtp","num_speculative_tokens":2}'
+    SPEC_MENU_LABEL="Tools + MTP (2 tokens)"
+fi
+
 echo "1) Tools             tool calling + reasoning  (use with Claude Code)"
-echo "2) Tools + MTP       tools + speculative decoding (faster decode)"
+echo "2) Tools + spec      tools + speculative decoding (faster decode)"
 echo "3) Text only         reasoning only, no tool calling"
 echo ""
 read -p "Enter choice [1-3]: " mode_choice
@@ -162,16 +216,8 @@ case $mode_choice in
         ;;
     2)
         MODE_FLAGS=(--reasoning-parser deepseek_v4 --enable-auto-tool-choice --tool-call-parser deepseek_v4)
-        echo ""
-        echo "Choose MTP tokens (model ships 1 MTP layer):"
-        echo "  1) 1 token  (safe default)"
-        echo "  2) 2 tokens (layer reused, usually still faster)"
-        read -p "Enter choice [1-2]: " mtp_choice
-        case $mtp_choice in
-            2) MODE_SPECULATIVE='{"method":"mtp","num_speculative_tokens":2}' ;;
-            *) MODE_SPECULATIVE='{"method":"mtp","num_speculative_tokens":1}' ;;
-        esac
-        MODE_LABEL="Tools + MTP"
+        MODE_SPECULATIVE="$SPEC_CONFIG"
+        MODE_LABEL="$SPEC_MENU_LABEL"
         ;;
     3)
         MODE_FLAGS=(--reasoning-parser deepseek_v4)
@@ -186,8 +232,8 @@ esac
 
 echo ""
 echo "Configuration:"
-echo "  Backend:     vLLM lucifer fork, sm_120a build  (conda env: deepseekv4)"
-echo "  Model:       DeepSeek-V4-Flash (MoE 284B/13B active, FP8+FP4, 149GB)"
+echo "  Backend:     vLLM sm_120a build  (conda env: $CONDA_ENV)"
+echo "  Model:       $MODEL_LABEL (MoE 284B/13B active, FP8+FP4)"
 echo "  GPUs:        Dual GPU TP=2 (required)"
 echo "  Mode:        $MODE_LABEL"
 echo "  Context:     $CTX_LABEL"
@@ -206,7 +252,7 @@ fi
 
 # Activate env directly instead of conda run to preserve argument quoting
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate deepseekv4
+conda activate "$CONDA_ENV"
 
 # DeepGEMM/FlashInfer JIT need nvcc at runtime. Must be CUDA 13.2 (env-local
 # conda toolkit): nvcc 13.0 fails template resolution on the SM120
@@ -233,7 +279,7 @@ export NVCC_THREADS=1
 # --block-size 256 + --kv-cache-dtype fp8: required V4 cache layout
 # --max-num-seqs 32: single-user box; keeps activation memory down on a model
 # that already fills most of both GPUs with weights.
-env $NCCL_ENV \
+env $NCCL_ENV $MODEL_ENV \
 CUDA_VISIBLE_DEVICES=0,1 \
 nohup vllm serve "$MODEL_PATH" \
     --host 127.0.0.1 \
@@ -246,7 +292,7 @@ nohup vllm serve "$MODEL_PATH" \
     --dtype auto \
     --kv-cache-dtype fp8 \
     --block-size 256 \
-    --attention-backend SPARSE_MLA_SM120 \
+    "${ATTN_ARGS[@]}" \
     --kernel-config.moe_backend flashinfer_cutlass \
     --trust-remote-code \
     --disable-custom-all-reduce \
